@@ -340,6 +340,12 @@ export default function RoomPage() {
           handleRtcEvent(event);
           return;
         }
+        if (event.type === "ROOM_ENDED") {
+          endCall(false);
+          window.alert("Host ended the room.");
+          navigate("/dashboard");
+          return;
+        }
 
         if (event.type === "PLAY") {
           setIsPlaying(true);
