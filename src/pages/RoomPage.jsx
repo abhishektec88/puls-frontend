@@ -1,0 +1,146 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { Client } from "@stomp/stompjs";
+import ReactPlayer from "react-player";
+import api from "../services/api";
+import { useAuth } from "../context/AuthContext";
+
+const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:8080/ws").replace(/^http/, "ws");
+
+export default function RoomPage() {
+  const { code } = useParams();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const playerRef = useRef(null);
+  const [room, setRoom] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [message, setMessage] = useState("");
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [videoUrl, setVideoUrl] = useState("");
+  const [currentTime, setCurrentTime] = useState(0);
+  const [localFileUrl, setLocalFileUrl] = useState("");
+  const clientRef = useRef(null);
+
+  const isHost = useMemo(() => room?.hostUserId === user?.id, [room, user]);
+
+  useEffect(() => {
+    const init = async () => {
+      const roomData = await api.get(`/rooms/${code}`);
+      const msgData = await api.get(`/rooms/${code}/messages`);
+      setRoom(roomData.data);
+      setMessages(msgData.data);
+    };
+    init();
+  }, [code]);
+
+  useEffect(() => {
+    const token = localStorage.getItem("accessToken");
+    const client = new Client({
+      brokerURL: WS_URL,
+      reconnectDelay: 5000,
+      connectHeaders: token ? { Authorization: `Bearer ${token}` } : {}
+    });
+    client.onConnect = () => {
+      client.subscribe(`/topic/rooms/${code}`, (frame) => {
+        const event = JSON.parse(frame.body);
+        if (event.type === "CHAT_MESSAGE") setMessages((prev) => [...prev, event.payload]);
+        if (event.type === "PLAY") setIsPlaying(true);
+        if (event.type === "PAUSE") setIsPlaying(false);
+        if (event.type === "SEEK" || event.type === "SYNC_STATE") {
+          const t = Number(event.currentTime ?? event.payload?.currentTime ?? 0);
+          playerRef.current?.seekTo(t, "seconds");
+          setCurrentTime(t);
+          setIsPlaying(String(event.isPlaying ?? event.payload?.isPlaying) === "true");
+        }
+      });
+      client.publish({ destination: `/app/rooms/${code}/sync-state-request`, body: "{}" });
+    };
+    client.activate();
+    clientRef.current = client;
+    return () => client.deactivate();
+  }, [code]);
+
+  const emit = (type, payload = {}) => {
+    clientRef.current?.publish({
+      destination: `/app/rooms/${code}/event`,
+      body: JSON.stringify({ type, ...payload })
+    });
+  };
+
+  const sendMessage = (e) => {
+    e.preventDefault();
+    emit("CHAT_MESSAGE", { message });
+    setMessage("");
+  };
+
+  const leaveRoom = async () => {
+    await api.post(`/rooms/${code}/leave`);
+    navigate("/dashboard");
+  };
+
+  const activeUrl = localFileUrl || videoUrl;
+
+  return (
+    <div className="min-h-screen p-4 md:p-6">
+      <div className="card mb-4 flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-semibold">{room?.roomName || "Room"}</h1>
+          <p className="text-sm text-slate-400">{room?.members?.length || 0} online</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Link className="btn border border-slate-700" to="/dashboard">Dashboard</Link>
+          <button className="btn border border-rose-500 text-rose-300" onClick={leaveRoom}>Leave</button>
+        </div>
+      </div>
+
+      <div className="grid lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 card">
+          <div className="flex gap-2 mb-3">
+            <input className="input" placeholder="YouTube or MP4 URL" value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} />
+            {isHost && (
+              <input
+                type="file"
+                accept="video/*"
+                className="text-sm"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) setLocalFileUrl(URL.createObjectURL(file));
+                }}
+              />
+            )}
+          </div>
+          <div className="rounded-xl overflow-hidden border border-slate-800">
+            <ReactPlayer ref={playerRef} url={activeUrl} controls width="100%" height="420px" playing={isPlaying} />
+          </div>
+          <div className="flex gap-2 mt-3">
+            <button disabled={!isHost} className="btn-primary disabled:opacity-50" onClick={() => { setIsPlaying(true); emit("PLAY", { currentTime, isPlaying: true }); }}>Play</button>
+            <button disabled={!isHost} className="btn border border-slate-700 disabled:opacity-50" onClick={() => { setIsPlaying(false); emit("PAUSE", { currentTime, isPlaying: false }); }}>Pause</button>
+            <button disabled={!isHost} className="btn border border-slate-700 disabled:opacity-50" onClick={() => { const t = playerRef.current?.getCurrentTime() || 0; emit("SEEK", { currentTime: t, isPlaying }); }}>Sync Seek</button>
+          </div>
+        </div>
+
+        <div className="card flex flex-col h-[calc(100vh-170px)]">
+          <h3 className="font-semibold mb-2">Chat</h3>
+          <div className="flex-1 overflow-y-auto space-y-2 mb-3">
+            {messages.map((m, idx) => (
+              <div key={m.id || `${m.senderId}-${idx}`} className="rounded-lg bg-slate-800 p-2 text-sm">
+                <span className="text-indigo-300">{m.senderName}: </span>{m.message}
+              </div>
+            ))}
+          </div>
+          <form onSubmit={sendMessage} className="flex gap-2">
+            <input className="input" value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Message..." required />
+            <button className="btn-primary">Send</button>
+          </form>
+          <div className="mt-4">
+            <h4 className="text-sm text-slate-400 mb-1">Members</h4>
+            <div className="flex flex-wrap gap-2">
+              {room?.members?.map((m) => <span key={m.id} className="text-xs bg-slate-800 px-2 py-1 rounded-full">{m.name}</span>)}
+            </div>
+            <p className="text-xs mt-3 text-slate-500">Invite: {window.location.href}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
