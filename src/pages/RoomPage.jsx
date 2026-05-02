@@ -7,6 +7,13 @@ import { useAuth } from "../context/AuthContext";
 
 const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:8080/ws").replace(/^http/, "ws");
 
+/** Only http(s) URLs can be shared; blob: file URLs are local to one browser. */
+function sharableHttpUrl(url) {
+  const u = (url || "").trim();
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  return "";
+}
+
 export default function RoomPage() {
   const { code } = useParams();
   const navigate = useNavigate();
@@ -20,8 +27,26 @@ export default function RoomPage() {
   const [currentTime, setCurrentTime] = useState(0);
   const [localFileUrl, setLocalFileUrl] = useState("");
   const clientRef = useRef(null);
+  const videoUrlRef = useRef("");
+  const isHostRef = useRef(false);
+  /** Only the first SYNC_STATE after mount sets play state; later SYNC_STATE broadcasts (e.g. others joining) must not overwrite PLAY/PAUSE. */
+  const appliedInitialSyncRef = useRef(false);
+  /** Guests: browsers often block unmuted autoplay — start muted so remote PLAY can start the iframe. */
+  const [muted, setMuted] = useState(true);
 
   const isHost = useMemo(() => room?.hostUserId === user?.id, [room, user]);
+
+  useEffect(() => {
+    videoUrlRef.current = videoUrl;
+  }, [videoUrl]);
+
+  useEffect(() => {
+    isHostRef.current = isHost;
+  }, [isHost]);
+
+  useEffect(() => {
+    if (isHost) setMuted(false);
+  }, [isHost]);
 
   useEffect(() => {
     const init = async () => {
@@ -34,6 +59,19 @@ export default function RoomPage() {
   }, [code]);
 
   useEffect(() => {
+    if (!isHost || !code) return;
+    const t = setTimeout(() => {
+      const u = sharableHttpUrl(videoUrl);
+      if (!u) return;
+      clientRef.current?.publish({
+        destination: `/app/rooms/${code}/event`,
+        body: JSON.stringify({ type: "VIDEO_URL", videoUrl: u })
+      });
+    }, 450);
+    return () => clearTimeout(t);
+  }, [videoUrl, isHost, code]);
+
+  useEffect(() => {
     const token = localStorage.getItem("accessToken");
     const client = new Client({
       brokerURL: WS_URL,
@@ -41,16 +79,44 @@ export default function RoomPage() {
       connectHeaders: token ? { Authorization: `Bearer ${token}` } : {}
     });
     client.onConnect = () => {
+      const u = sharableHttpUrl(videoUrlRef.current);
+      if (u && isHostRef.current) {
+        client.publish({
+          destination: `/app/rooms/${code}/event`,
+          body: JSON.stringify({ type: "VIDEO_URL", videoUrl: u })
+        });
+      }
       client.subscribe(`/topic/rooms/${code}`, (frame) => {
         const event = JSON.parse(frame.body);
         if (event.type === "CHAT_MESSAGE") setMessages((prev) => [...prev, event.payload]);
-        if (event.type === "PLAY") setIsPlaying(true);
-        if (event.type === "PAUSE") setIsPlaying(false);
-        if (event.type === "SEEK" || event.type === "SYNC_STATE") {
+        const sharedUrl = event.videoUrl || event.payload?.videoUrl;
+        if (sharedUrl) setVideoUrl(String(sharedUrl));
+
+        if (event.type === "PLAY") {
+          setIsPlaying(true);
+          return;
+        }
+        if (event.type === "PAUSE") {
+          setIsPlaying(false);
+          return;
+        }
+        if (event.type === "SEEK") {
           const t = Number(event.currentTime ?? event.payload?.currentTime ?? 0);
           playerRef.current?.seekTo(t, "seconds");
           setCurrentTime(t);
           setIsPlaying(String(event.isPlaying ?? event.payload?.isPlaying) === "true");
+          return;
+        }
+        if (event.type === "SYNC_STATE") {
+          const p = event.payload || {};
+          if (p.videoUrl) setVideoUrl(String(p.videoUrl));
+          const t = Number(p.currentTime ?? 0);
+          playerRef.current?.seekTo(t, "seconds");
+          setCurrentTime(t);
+          if (!appliedInitialSyncRef.current) {
+            setIsPlaying(String(p.isPlaying) === "true");
+            appliedInitialSyncRef.current = true;
+          }
         }
       });
       client.publish({ destination: `/app/rooms/${code}/sync-state-request`, body: "{}" });
@@ -61,9 +127,11 @@ export default function RoomPage() {
   }, [code]);
 
   const emit = (type, payload = {}) => {
+    const u = sharableHttpUrl(videoUrl);
+    const body = u ? { type, videoUrl: u, ...payload } : { type, ...payload };
     clientRef.current?.publish({
       destination: `/app/rooms/${code}/event`,
-      body: JSON.stringify({ type, ...payload })
+      body: JSON.stringify(body)
     });
   };
 
@@ -96,7 +164,14 @@ export default function RoomPage() {
       <div className="grid lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 card">
           <div className="flex gap-2 mb-3">
-            <input className="input" placeholder="YouTube or MP4 URL" value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} />
+            <input
+              className="input"
+              placeholder="YouTube or MP4 URL"
+              value={videoUrl}
+              readOnly={!isHost}
+              title={!isHost ? "Only the host can set the shared video URL" : undefined}
+              onChange={(e) => setVideoUrl(e.target.value)}
+            />
             {isHost && (
               <input
                 type="file"
@@ -110,8 +185,27 @@ export default function RoomPage() {
             )}
           </div>
           <div className="rounded-xl overflow-hidden border border-slate-800">
-            <ReactPlayer ref={playerRef} url={activeUrl} controls width="100%" height="420px" playing={isPlaying} />
+            <ReactPlayer
+              ref={playerRef}
+              url={activeUrl}
+              controls
+              width="100%"
+              height="420px"
+              playing={isPlaying}
+              muted={muted}
+              volume={muted ? 0 : 0.9}
+              config={{
+                youtube: {
+                  playerVars: { playsinline: 1 }
+                }
+              }}
+            />
           </div>
+          {!isHost && (
+            <button type="button" className="text-xs text-slate-400 mt-1 underline" onClick={() => setMuted((m) => !m)}>
+              {muted ? "Unmute (required for autoplay in some browsers)" : "Mute"}
+            </button>
+          )}
           <div className="flex gap-2 mt-3">
             <button disabled={!isHost} className="btn-primary disabled:opacity-50" onClick={() => { setIsPlaying(true); emit("PLAY", { currentTime, isPlaying: true }); }}>Play</button>
             <button disabled={!isHost} className="btn border border-slate-700 disabled:opacity-50" onClick={() => { setIsPlaying(false); emit("PAUSE", { currentTime, isPlaying: false }); }}>Pause</button>
