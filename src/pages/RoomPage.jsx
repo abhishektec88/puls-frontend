@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import axios from "axios";
 import { Client } from "@stomp/stompjs";
 import ReactPlayer from "react-player";
 import api from "../services/api";
+import { wsUrl } from "../config/runtime";
 import { useAuth } from "../context/AuthContext";
 
-const WS_URL = (import.meta.env.VITE_WS_URL || "ws://localhost:8080/ws").replace(/^http/, "ws");
+const WS_URL = wsUrl();
 
 /** Only http(s) URLs can be shared; blob: file URLs are local to one browser. */
 function sharableHttpUrl(url) {
@@ -25,7 +27,7 @@ export default function RoomPage() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoUrl, setVideoUrl] = useState("");
   const [currentTime, setCurrentTime] = useState(0);
-  const [localFileUrl, setLocalFileUrl] = useState("");
+  const [mediaUploading, setMediaUploading] = useState(false);
   const clientRef = useRef(null);
   const videoUrlRef = useRef("");
   const isHostRef = useRef(false);
@@ -146,7 +148,7 @@ export default function RoomPage() {
     navigate("/dashboard");
   };
 
-  const activeUrl = localFileUrl || videoUrl;
+  const activeUrl = videoUrl;
 
   return (
     <div className="min-h-screen p-4 md:p-6">
@@ -176,10 +178,47 @@ export default function RoomPage() {
               <input
                 type="file"
                 accept="video/*"
-                className="text-sm"
-                onChange={(e) => {
+                disabled={mediaUploading}
+                className="text-sm disabled:opacity-50"
+                title="Upload streams from the server so others can watch (blob URLs stay local to your browser)."
+                onChange={async (e) => {
                   const file = e.target.files?.[0];
-                  if (file) setLocalFileUrl(URL.createObjectURL(file));
+                  const input = e.target;
+                  if (!file || !code) return;
+                  setMediaUploading(true);
+                  try {
+                    const form = new FormData();
+                    form.append("file", file);
+                    const { data } = await api.post(`/rooms/${code}/media`, form, {
+                      timeout: 0,
+                      maxBodyLength: Infinity,
+                      maxContentLength: Infinity
+                    });
+                    if (data?.playbackUrl) setVideoUrl(String(data.playbackUrl));
+                  } catch (err) {
+                    console.error(err);
+                    let attempted = "";
+                    try {
+                      if (err.config) {
+                        const rel = axios.getUri(err.config);
+                        attempted =
+                          rel.startsWith("http") || !window?.location?.origin
+                            ? rel
+                            : `${window.location.origin}${rel.startsWith("/") ? rel : `/${rel}`}`;
+                      }
+                    } catch (_) {
+                      /* ignore */
+                    }
+                    const msg =
+                      err.response?.data?.message
+                      || (err.code === "ERR_NETWORK" || err.message === "Network Error"
+                        ? `No response from API${attempted ? ` (${attempted})` : ""}. Start Spring Boot, match its port to VITE_DEV_PROXY_TARGET in .env (default 8080), restart Vite, and use "npm run dev" or "vite preview" (both proxy /api).`
+                        : err.message);
+                    window.alert(msg || "Upload failed");
+                  } finally {
+                    setMediaUploading(false);
+                    input.value = "";
+                  }
                 }}
               />
             )}
